@@ -4,7 +4,6 @@ const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
 require('dotenv').config();
 
-const connectDB = require('./config/db');
 const authRoutes = require('./routes/authRoutes');
 const transactionRoutes = require('./routes/transactionRoutes');
 const walletRoutes = require('./routes/walletRoutes');
@@ -34,9 +33,6 @@ app.use(
 app.use(express.json());
 app.use(cookieParser());
 
-// Connect Database
-connectDB();
-
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -44,6 +40,7 @@ app.get('/api/health', (req, res) => {
 
 // API Routes
 app.use('/auth', authRoutes);
+app.use('/api/auth', authRoutes);
 app.use('/transactions', transactionRoutes);
 app.use('/wallets', walletRoutes);
 app.use('/loans', loanRoutes);

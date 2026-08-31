@@ -1,28 +1,37 @@
-const SavingsGoal = require('../models/SavingsGoal');
-const Transaction = require('../models/Transaction');
+const defaultSupabase = require('../config/supabase');
 
 const getGoals = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
 
-    const goals = await SavingsGoal.find({ userId }).sort({ createdAt: -1 }).lean();
+    const { data: goals, error } = await supabase
+      .from('savings_goals')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
 
-    const formattedGoals = goals.map((g) => {
-      const target = g.targetAmount / 100;
-      const current = g.currentAmount / 100;
+    if (error) {
+      console.error('Fetch goals error:', error);
+      return res.status(500).json({ error: 'Failed to fetch savings goals' });
+    }
+
+    const formattedGoals = (goals || []).map((g) => {
+      const target = g.target_amount / 100;
+      const current = g.current_amount / 100;
       const remaining = Math.max(0, target - current);
       const percentage = target > 0 ? Math.min(100, Math.round((current / target) * 100)) : 0;
 
       return {
-        id: g._id.toString(),
+        id: g.id,
         name: g.name,
         targetAmount: target,
         currentAmount: current,
         remaining,
         percentage,
-        targetDate: g.targetDate,
+        targetDate: g.target_date,
         status: g.status,
-        createdAt: g.createdAt,
+        createdAt: g.created_at,
       };
     });
 
@@ -42,28 +51,38 @@ const getGoals = async (req, res) => {
 const createGoal = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
     const { name, targetAmount, targetDate } = req.body;
 
     const targetInCents = Math.round(targetAmount * 100);
-    const parsedTargetDate = targetDate ? new Date(targetDate) : null;
+    const parsedTargetDate = targetDate ? new Date(targetDate).toISOString() : null;
 
-    const goal = await SavingsGoal.create({
-      userId,
-      name: name.trim(),
-      targetAmount: targetInCents,
-      currentAmount: 0,
-      targetDate: parsedTargetDate,
-      status: 'active',
-    });
+    const { data: goal, error } = await supabase
+      .from('savings_goals')
+      .insert({
+        user_id: userId,
+        name: name.trim(),
+        target_amount: targetInCents,
+        current_amount: 0,
+        target_date: parsedTargetDate,
+        status: 'active',
+      })
+      .select()
+      .single();
+
+    if (error || !goal) {
+      console.error('Create goal error:', error);
+      return res.status(500).json({ error: 'Failed to create savings goal' });
+    }
 
     return res.status(201).json({
-      id: goal._id.toString(),
+      id: goal.id,
       name: goal.name,
-      targetAmount: goal.targetAmount / 100,
+      targetAmount: goal.target_amount / 100,
       currentAmount: 0,
-      remaining: goal.targetAmount / 100,
+      remaining: goal.target_amount / 100,
       percentage: 0,
-      targetDate: goal.targetDate,
+      targetDate: goal.target_date,
       status: goal.status,
     });
   } catch (error) {
@@ -75,45 +94,62 @@ const createGoal = async (req, res) => {
 const contributeGoal = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
     const { id } = req.params;
     const { amount, paymentMethod } = req.body;
 
-    const goal = await SavingsGoal.findOne({ _id: id, userId });
-    if (!goal) {
+    const { data: goal, error: fetchErr } = await supabase
+      .from('savings_goals')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchErr || !goal) {
       return res.status(404).json({ error: 'Savings goal not found' });
     }
 
     const contribCents = Math.round(amount * 100);
+    const newCurrentAmount = goal.current_amount + contribCents;
+    const newStatus = newCurrentAmount >= goal.target_amount ? 'achieved' : goal.status;
 
-    // 1. Update Goal currentAmount
-    goal.currentAmount += contribCents;
+    // 1. Update Goal currentAmount & status
+    const { data: updatedGoal, error: updateErr } = await supabase
+      .from('savings_goals')
+      .update({
+        current_amount: newCurrentAmount,
+        status: newStatus,
+      })
+      .eq('id', goal.id)
+      .eq('user_id', userId)
+      .select()
+      .single();
 
-    if (goal.currentAmount >= goal.targetAmount) {
-      goal.status = 'achieved';
+    if (updateErr) {
+      console.error('Update goal error:', updateErr);
+      return res.status(500).json({ error: 'Failed to update savings goal' });
     }
 
-    await goal.save();
-
     // 2. Create linked Expense Transaction
-    await Transaction.create({
-      userId,
+    await supabase.from('transactions').insert({
+      user_id: userId,
       type: 'expense',
       amount: contribCents,
       category: `Savings: ${goal.name}`,
-      paymentMethod,
+      payment_method: paymentMethod,
       note: `Contribution to ${goal.name}`,
-      linkedGoalId: goal._id,
-      date: new Date(),
+      linked_goal_id: goal.id,
+      date: new Date().toISOString(),
     });
 
     return res.status(200).json({
-      id: goal._id.toString(),
-      name: goal.name,
-      currentAmount: goal.currentAmount / 100,
-      targetAmount: goal.targetAmount / 100,
-      remaining: Math.max(0, (goal.targetAmount - goal.currentAmount) / 100),
-      percentage: Math.min(100, Math.round((goal.currentAmount / goal.targetAmount) * 100)),
-      status: goal.status,
+      id: updatedGoal.id,
+      name: updatedGoal.name,
+      currentAmount: updatedGoal.current_amount / 100,
+      targetAmount: updatedGoal.target_amount / 100,
+      remaining: Math.max(0, (updatedGoal.target_amount - updatedGoal.current_amount) / 100),
+      percentage: Math.min(100, Math.round((updatedGoal.current_amount / updatedGoal.target_amount) * 100)),
+      status: updatedGoal.status,
     });
   } catch (error) {
     console.error('Contribute goal error:', error);
@@ -124,18 +160,36 @@ const contributeGoal = async (req, res) => {
 const deleteGoal = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
     const { id } = req.params;
 
-    const goal = await SavingsGoal.findOne({ _id: id, userId });
-    if (!goal) {
+    const { data: goal, error: fetchErr } = await supabase
+      .from('savings_goals')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchErr || !goal) {
       return res.status(404).json({ error: 'Savings goal not found' });
     }
 
-    // Option A: Unlink linked goal transactions so historical spending records remain accurate
-    await Transaction.updateMany({ linkedGoalId: goal._id, userId }, { $set: { linkedGoalId: null } });
+    await supabase
+      .from('transactions')
+      .update({ linked_goal_id: null })
+      .eq('linked_goal_id', goal.id)
+      .eq('user_id', userId);
 
-    // Delete Goal container
-    await SavingsGoal.deleteOne({ _id: id, userId });
+    const { error: deleteErr } = await supabase
+      .from('savings_goals')
+      .delete()
+      .eq('id', goal.id)
+      .eq('user_id', userId);
+
+    if (deleteErr) {
+      console.error('Delete goal error:', deleteErr);
+      return res.status(500).json({ error: 'Failed to delete savings goal' });
+    }
 
     return res.status(200).json({ message: 'Savings goal deleted', id });
   } catch (error) {

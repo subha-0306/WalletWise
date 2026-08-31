@@ -1,37 +1,45 @@
-const Transaction = require('../models/Transaction');
+const defaultSupabase = require('../config/supabase');
 const { processRecurringTransactions } = require('../utils/recurringGenerator');
 
 const getTransactions = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
     
     // Auto-process due recurring transactions on read
-    await processRecurringTransactions(userId);
+    await processRecurringTransactions(userId, supabase);
 
     const page = parseInt(req.query.page, 10) || 1;
     const limit = parseInt(req.query.limit, 10) || 20;
     const skip = (page - 1) * limit;
 
-    const total = await Transaction.countDocuments({ userId });
-    const transactions = await Transaction.find({ userId })
-      .sort({ date: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
+    const { data: transactions, count, error } = await supabase
+      .from('transactions')
+      .select('*', { count: 'exact' })
+      .eq('user_id', userId)
+      .order('date', { ascending: false })
+      .order('created_at', { ascending: false })
+      .range(skip, skip + limit - 1);
 
-    const formattedTransactions = transactions.map((t) => ({
-      id: t._id.toString(),
+    if (error) {
+      console.error('Fetch transactions error:', error);
+      return res.status(500).json({ error: 'Failed to fetch transactions', details: error.message });
+    }
+
+    const total = count || 0;
+    const formattedTransactions = (transactions || []).map((t) => ({
+      id: t.id,
       type: t.type,
       amount: t.amount / 100,
       amountInCents: t.amount,
       category: t.category,
-      paymentMethod: t.paymentMethod,
+      paymentMethod: t.payment_method,
       note: t.note || '',
-      linkedLoanId: t.linkedLoanId,
-      linkedGoalId: t.linkedGoalId,
-      affectsLinkedRecord: !!(t.linkedLoanId || t.linkedGoalId),
+      linkedLoanId: t.linked_loan_id,
+      linkedGoalId: t.linked_goal_id,
+      affectsLinkedRecord: !!(t.linked_loan_id || t.linked_goal_id),
       date: t.date,
-      createdAt: t.createdAt,
+      createdAt: t.created_at,
     }));
 
     return res.status(200).json({
@@ -45,102 +53,147 @@ const getTransactions = async (req, res) => {
     });
   } catch (error) {
     console.error('Get transactions error:', error);
-    return res.status(500).json({ error: 'Failed to fetch transactions' });
+    return res.status(500).json({ error: 'Failed to fetch transactions', details: error.message });
   }
 };
 
 const createTransaction = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
     const { type, amount, category, paymentMethod, note, date } = req.body;
 
     const amountInCents = Math.round(amount * 100);
-    const transactionDate = date ? new Date(date) : new Date();
+    const transactionDate = date ? new Date(date).toISOString() : new Date().toISOString();
 
-    const transaction = await Transaction.create({
-      userId,
-      type,
-      amount: amountInCents,
-      category,
-      paymentMethod,
-      note: note ? note.trim() : '',
-      date: transactionDate,
-    });
+    const { data: transaction, error } = await supabase
+      .from('transactions')
+      .insert({
+        user_id: userId,
+        type,
+        amount: amountInCents,
+        category,
+        payment_method: paymentMethod,
+        note: note ? note.trim() : '',
+        date: transactionDate,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Insert transaction error:', error);
+      return res.status(500).json({ error: 'Failed to create transaction', details: error.message });
+    }
 
     return res.status(201).json({
-      id: transaction._id.toString(),
+      id: transaction.id,
       type: transaction.type,
       amount: transaction.amount / 100,
       amountInCents: transaction.amount,
       category: transaction.category,
-      paymentMethod: transaction.paymentMethod,
+      paymentMethod: transaction.payment_method,
       note: transaction.note,
       date: transaction.date,
-      createdAt: transaction.createdAt,
+      createdAt: transaction.created_at,
     });
   } catch (error) {
     console.error('Create transaction error:', error);
-    return res.status(500).json({ error: 'Failed to create transaction' });
+    return res.status(500).json({ error: 'Failed to create transaction', details: error.message });
   }
 };
 
 const updateTransaction = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
     const { id } = req.params;
     const { type, amount, category, paymentMethod, note, date } = req.body;
 
-    const transaction = await Transaction.findOne({ _id: id, userId });
-    if (!transaction) {
+    const { data: existingTx, error: fetchErr } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchErr || !existingTx) {
       return res.status(404).json({ error: 'Transaction not found or unauthorized' });
     }
 
-    const isLinked = !!(transaction.linkedLoanId || transaction.linkedGoalId);
+    const updates = {};
+    if (type) updates.type = type;
+    if (amount !== undefined) updates.amount = Math.round(amount * 100);
+    if (category) updates.category = category.trim();
+    if (paymentMethod) updates.payment_method = paymentMethod;
+    if (note !== undefined) updates.note = note ? note.trim() : '';
+    if (date) updates.date = new Date(date).toISOString();
 
-    if (type) transaction.type = type;
-    if (amount !== undefined) transaction.amount = Math.round(amount * 100);
-    if (category) transaction.category = category.trim();
-    if (paymentMethod) transaction.paymentMethod = paymentMethod;
-    if (note !== undefined) transaction.note = note ? note.trim() : '';
-    if (date) transaction.date = new Date(date);
+    const { data: updatedTx, error: updateErr } = await supabase
+      .from('transactions')
+      .update(updates)
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select()
+      .single();
 
-    await transaction.save();
+    if (updateErr) {
+      console.error('Update transaction error:', updateErr);
+      return res.status(500).json({ error: 'Failed to update transaction', details: updateErr.message });
+    }
+
+    const isLinked = !!(updatedTx.linked_loan_id || updatedTx.linked_goal_id);
 
     return res.status(200).json({
-      id: transaction._id.toString(),
-      type: transaction.type,
-      amount: transaction.amount / 100,
-      amountInCents: transaction.amount,
-      category: transaction.category,
-      paymentMethod: transaction.paymentMethod,
-      note: transaction.note,
-      linkedLoanId: transaction.linkedLoanId,
-      linkedGoalId: transaction.linkedGoalId,
+      id: updatedTx.id,
+      type: updatedTx.type,
+      amount: updatedTx.amount / 100,
+      amountInCents: updatedTx.amount,
+      category: updatedTx.category,
+      paymentMethod: updatedTx.payment_method,
+      note: updatedTx.note,
+      linkedLoanId: updatedTx.linked_loan_id,
+      linkedGoalId: updatedTx.linked_goal_id,
       affectsLinkedRecord: isLinked,
-      date: transaction.date,
+      date: updatedTx.date,
     });
   } catch (error) {
     console.error('Update transaction error:', error);
-    return res.status(500).json({ error: 'Failed to update transaction' });
+    return res.status(500).json({ error: 'Failed to update transaction', details: error.message });
   }
 };
 
 const deleteTransaction = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
     const { id } = req.params;
 
-    const transaction = await Transaction.findOne({ _id: id, userId });
-    if (!transaction) {
+    const { data: transaction, error: fetchErr } = await supabase
+      .from('transactions')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchErr || !transaction) {
       return res.status(404).json({ error: 'Transaction not found or unauthorized' });
     }
 
-    await Transaction.deleteOne({ _id: id, userId });
+    const { error: deleteErr } = await supabase
+      .from('transactions')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId);
+
+    if (deleteErr) {
+      console.error('Delete transaction error:', deleteErr);
+      return res.status(500).json({ error: 'Failed to delete transaction', details: deleteErr.message });
+    }
 
     return res.status(200).json({ message: 'Transaction deleted successfully', id });
   } catch (error) {
     console.error('Delete transaction error:', error);
-    return res.status(500).json({ error: 'Failed to delete transaction' });
+    return res.status(500).json({ error: 'Failed to delete transaction', details: error.message });
   }
 };
 

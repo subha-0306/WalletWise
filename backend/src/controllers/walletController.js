@@ -1,5 +1,4 @@
-const mongoose = require('mongoose');
-const Transaction = require('../models/Transaction');
+const defaultSupabase = require('../config/supabase');
 const { processRecurringTransactions } = require('../utils/recurringGenerator');
 
 const ALL_PAYMENT_METHODS = [
@@ -13,63 +12,56 @@ const ALL_PAYMENT_METHODS = [
 const getWalletSummary = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const supabase = req.supabase || defaultSupabase;
 
     // Auto-process due recurring items on read before computing balances
-    await processRecurringTransactions(userId);
+    await processRecurringTransactions(userId, supabase);
 
-    const aggregationResult = await Transaction.aggregate([
-      {
-        $match: {
-          userId: new mongoose.Types.ObjectId(userId),
-        },
-      },
-      {
-        $group: {
-          _id: '$paymentMethod',
-          totalIncome: {
-            $sum: {
-              $cond: [{ $eq: ['$type', 'income'] }, '$amount', 0],
-            },
-          },
-          totalExpense: {
-            $sum: {
-              $cond: [{ $eq: ['$type', 'expense'] }, '$amount', 0],
-            },
-          },
-        },
-      },
-      {
-        $project: {
-          paymentMethod: '$_id',
-          balanceInCents: { $subtract: ['$totalIncome', '$totalExpense'] },
-          incomeInCents: '$totalIncome',
-          expenseInCents: '$totalExpense',
-        },
-      },
-    ]);
+    const { data: transactions, error } = await supabase
+      .from('transactions')
+      .select('payment_method, type, amount')
+      .eq('user_id', userId);
+
+    if (error) {
+      console.error('Wallet summary fetch error:', error);
+      return res.status(500).json({ error: 'Failed to compute wallet summary' });
+    }
 
     const summaryMap = {};
-    aggregationResult.forEach((item) => {
-      summaryMap[item.paymentMethod] = {
-        balance: item.balanceInCents / 100,
-        balanceInCents: item.balanceInCents,
-        totalIncome: item.incomeInCents / 100,
-        totalExpense: item.expenseInCents / 100,
+    ALL_PAYMENT_METHODS.forEach((method) => {
+      summaryMap[method] = {
+        totalIncome: 0,
+        totalExpense: 0,
       };
+    });
+
+    (transactions || []).forEach((t) => {
+      const method = t.payment_method;
+      if (!summaryMap[method]) {
+        summaryMap[method] = { totalIncome: 0, totalExpense: 0 };
+      }
+      if (t.type === 'income') {
+        summaryMap[method].totalIncome += t.amount;
+      } else if (t.type === 'expense') {
+        summaryMap[method].totalExpense += t.amount;
+      }
     });
 
     const methodsSummary = {};
     let totalAvailableInCents = 0;
 
     ALL_PAYMENT_METHODS.forEach((method) => {
-      const data = summaryMap[method] || {
-        balance: 0,
-        balanceInCents: 0,
-        totalIncome: 0,
-        totalExpense: 0,
+      const inc = summaryMap[method].totalIncome;
+      const exp = summaryMap[method].totalExpense;
+      const balanceInCents = inc - exp;
+
+      methodsSummary[method] = {
+        balance: balanceInCents / 100,
+        balanceInCents,
+        totalIncome: inc / 100,
+        totalExpense: exp / 100,
       };
-      methodsSummary[method] = data;
-      totalAvailableInCents += data.balanceInCents;
+      totalAvailableInCents += balanceInCents;
     });
 
     return res.status(200).json({

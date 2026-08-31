@@ -1,30 +1,9 @@
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const supabase = require('../config/supabase');
 
-const ACCESS_TOKEN_EXPIRY = '15m';
-const REFRESH_TOKEN_EXPIRY = '30d';
 const REFRESH_COOKIE_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days in ms
 
-const generateTokens = (user) => {
-  const payload = { userId: user._id.toString(), email: user.email };
-
-  const accessToken = jwt.sign(
-    payload,
-    process.env.JWT_ACCESS_SECRET || 'super_secret_access_key_walletwise_2026',
-    { expiresIn: ACCESS_TOKEN_EXPIRY }
-  );
-
-  const refreshToken = jwt.sign(
-    payload,
-    process.env.JWT_REFRESH_SECRET || 'super_secret_refresh_key_walletwise_2026',
-    { expiresIn: REFRESH_TOKEN_EXPIRY }
-  );
-
-  return { accessToken, refreshToken };
-};
-
 const setRefreshCookie = (res, refreshToken) => {
+  if (!refreshToken) return;
   const isProd = process.env.NODE_ENV === 'production';
   res.cookie('refreshToken', refreshToken, {
     httpOnly: true,
@@ -39,28 +18,75 @@ const register = async (req, res) => {
   try {
     const { email, password, name } = req.body;
 
-    const existingUser = await User.findOne({ email: email.toLowerCase() });
-    if (existingUser) {
-      return res.status(400).json({ error: 'User with this email already exists' });
+    if (!email || !password || !name) {
+      return res.status(400).json({ error: 'Email, password, and name are required' });
     }
 
-    // Cost factor 12 as required
-    const passwordHash = await bcrypt.hash(password, 12);
+    const cleanEmail = email.toLowerCase().trim();
+    const cleanName = name.trim();
 
-    const user = await User.create({
-      email: email.toLowerCase(),
-      passwordHash,
-      name,
+    // 1. Create user in Supabase Auth
+    const { data, error } = await supabase.auth.signUp({
+      email: cleanEmail,
+      password,
+      options: {
+        data: { name: cleanName },
+      },
     });
 
-    const { accessToken, refreshToken } = generateTokens(user);
-    setRefreshCookie(res, refreshToken);
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    const user = data.user;
+    if (!user) {
+      return res.status(400).json({ error: 'User registration failed' });
+    }
+
+    // 2. Auto-confirm user email so sign in works immediately without manual email verification
+    try {
+      await supabase.auth.admin.updateUserById(user.id, { email_confirm: true });
+    } catch (confirmErr) {
+      console.warn('Auto email confirmation warning:', confirmErr.message || confirmErr);
+    }
+
+    // 3. Idempotent Upsert into profiles table (handles existing profile gracefully without 23505 error)
+    const { error: profileError } = await supabase
+      .from('profiles')
+      .upsert(
+        { id: user.id, name: cleanName },
+        { onConflict: 'id', ignoreDuplicates: false }
+      );
+
+    if (profileError && profileError.code !== '23505') {
+      console.error('Error upserting profile:', profileError);
+    }
+
+    // 4. Resolve session (obtain session via signInWithPassword if signUp session is null)
+    let session = data.session;
+    if (!session) {
+      try {
+        const { data: signInData } = await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password,
+        });
+        if (signInData?.session) {
+          session = signInData.session;
+        }
+      } catch (signInErr) {
+        console.warn('Post-register sign in attempt warning:', signInErr);
+      }
+    }
+
+    if (session?.refresh_token) {
+      setRefreshCookie(res, session.refresh_token);
+    }
 
     return res.status(201).json({
-      accessToken,
+      accessToken: session?.access_token || null,
       user: {
-        id: user._id.toString(),
-        name: user.name,
+        id: user.id,
+        name: cleanName,
         email: user.email,
       },
     });
@@ -74,24 +100,43 @@ const login = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) {
-      return res.status(400).json({ error: 'Invalid email or password' });
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const isMatch = await bcrypt.compare(password, user.passwordHash);
-    if (!isMatch) {
-      return res.status(400).json({ error: 'Invalid email or password' });
+    const cleanEmail = email.toLowerCase().trim();
+
+    // 1. Authenticate with Supabase Auth
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: cleanEmail,
+      password,
+    });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
     }
 
-    const { accessToken, refreshToken } = generateTokens(user);
-    setRefreshCookie(res, refreshToken);
+    const user = data.user;
+
+    // 2. Fetch profile data
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('name')
+      .eq('id', user.id)
+      .single();
+
+    const name = profile?.name || user.user_metadata?.name || '';
+
+    // 3. Set refresh cookie
+    if (data.session?.refresh_token) {
+      setRefreshCookie(res, data.session.refresh_token);
+    }
 
     return res.status(200).json({
-      accessToken,
+      accessToken: data.session?.access_token || null,
       user: {
-        id: user._id.toString(),
-        name: user.name,
+        id: user.id,
+        name,
         email: user.email,
       },
     });
@@ -108,32 +153,34 @@ const refresh = async (req, res) => {
       return res.status(401).json({ error: 'Refresh token cookie missing' });
     }
 
-    jwt.verify(
-      refreshToken,
-      process.env.JWT_REFRESH_SECRET || 'super_secret_refresh_key_walletwise_2026',
-      async (err, decoded) => {
-        if (err) {
-          return res.status(401).json({ error: 'Invalid or expired refresh token' });
-        }
+    const { data, error } = await supabase.auth.refreshSession({
+      refresh_token: refreshToken,
+    });
 
-        const user = await User.findById(decoded.userId);
-        if (!user) {
-          return res.status(401).json({ error: 'User no longer exists' });
-        }
+    if (error || !data.session) {
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
 
-        const tokens = generateTokens(user);
-        setRefreshCookie(res, tokens.refreshToken);
+    const user = data.user;
 
-        return res.status(200).json({
-          accessToken: tokens.accessToken,
-          user: {
-            id: user._id.toString(),
-            name: user.name,
-            email: user.email,
-          },
-        });
-      }
-    );
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('name')
+      .eq('id', user.id)
+      .single();
+
+    if (data.session?.refresh_token) {
+      setRefreshCookie(res, data.session.refresh_token);
+    }
+
+    return res.status(200).json({
+      accessToken: data.session.access_token,
+      user: {
+        id: user.id,
+        name: profile?.name || user.user_metadata?.name || '',
+        email: user.email,
+      },
+    });
   } catch (error) {
     console.error('Refresh token error:', error);
     return res.status(500).json({ error: 'Failed to refresh token' });
@@ -141,6 +188,12 @@ const refresh = async (req, res) => {
 };
 
 const logout = async (req, res) => {
+  try {
+    await supabase.auth.signOut();
+  } catch (err) {
+    console.error('Supabase signOut error:', err);
+  }
+
   const isProd = process.env.NODE_ENV === 'production';
   res.clearCookie('refreshToken', {
     httpOnly: true,

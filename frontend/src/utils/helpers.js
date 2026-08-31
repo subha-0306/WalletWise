@@ -16,6 +16,15 @@ export const CATEGORIES = [
   { id: 'Other', label: 'Other', iconName: 'MoreHorizontal' },
 ];
 
+export const getLocalDateString = (d = new Date()) => {
+  const dateObj = typeof d === 'string' || typeof d === 'number' ? new Date(d) : d;
+  if (isNaN(dateObj.getTime())) return getLocalDateString(new Date());
+  const year = dateObj.getFullYear();
+  const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const day = String(dateObj.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
 export const formatCurrency = (amount) => {
   const num = typeof amount === 'number' ? amount : 0;
   return new Intl.NumberFormat('en-IN', {
@@ -27,7 +36,10 @@ export const formatCurrency = (amount) => {
 };
 
 export const formatDateGroup = (dateString) => {
+  if (!dateString) return 'Today';
   const date = new Date(dateString);
+  if (isNaN(date.getTime())) return 'Today';
+
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const yesterday = new Date(today);
@@ -50,7 +62,9 @@ export const formatDateGroup = (dateString) => {
 };
 
 export const formatTime = (dateString) => {
+  if (!dateString) return '';
   const date = new Date(dateString);
+  if (isNaN(date.getTime())) return '';
   return date.toLocaleTimeString('en-IN', {
     hour: 'numeric',
     minute: '2-digit',

@@ -1,50 +1,66 @@
-const RecurringTransaction = require('../models/RecurringTransaction');
-const Transaction = require('../models/Transaction');
+const defaultSupabase = require('../config/supabase');
 
-const processRecurringTransactions = async (userId) => {
+const processRecurringTransactions = async (userId, customClient) => {
   try {
-    const now = new Date();
+    const supabase = customClient || defaultSupabase;
+    const nowIso = new Date().toISOString();
 
     // Find active recurring templates due today or earlier
-    const dueItems = await RecurringTransaction.find({
-      userId,
-      active: true,
-      nextDueDate: { $lte: now },
-    });
+    const { data: dueItems, error } = await supabase
+      .from('recurring_transactions')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('active', true)
+      .lte('next_due_date', nowIso);
+
+    if (error) {
+      console.error('Error fetching due recurring items:', error);
+      return;
+    }
 
     if (!dueItems || dueItems.length === 0) {
       return;
     }
 
-    for (const item of dueItems) {
-      // Loop safety limit in case an item is far in the past (max 24 iterations per read)
-      let iterations = 0;
+    const now = new Date();
 
-      while (item.nextDueDate <= now && iterations < 24) {
+    for (const item of dueItems) {
+      let iterations = 0;
+      let currentDueDate = new Date(item.next_due_date);
+
+      while (currentDueDate <= now && iterations < 24) {
         iterations++;
 
         // 1. Create real Transaction for occurrence
-        await Transaction.create({
-          userId: item.userId,
+        const { error: txError } = await supabase.from('transactions').insert({
+          user_id: item.user_id,
           type: item.type,
           amount: item.amount,
           category: item.category,
-          paymentMethod: item.paymentMethod,
+          payment_method: item.payment_method,
           note: item.note ? item.note : `Recurring: ${item.category}`,
-          date: new Date(item.nextDueDate),
+          date: currentDueDate.toISOString(),
         });
 
-        // 2. Advance nextDueDate by frequency interval
-        const currentDueDate = new Date(item.nextDueDate);
+        if (txError) {
+          console.error('Error inserting recurring transaction occurrence:', txError);
+          break;
+        }
+
+        // 2. Advance next_due_date by frequency interval
         if (item.frequency === 'weekly') {
           currentDueDate.setDate(currentDueDate.getDate() + 7);
         } else if (item.frequency === 'monthly') {
           currentDueDate.setMonth(currentDueDate.getMonth() + 1);
         }
-        item.nextDueDate = currentDueDate;
       }
 
-      await item.save();
+      // Update next_due_date in DB
+      await supabase
+        .from('recurring_transactions')
+        .update({ next_due_date: currentDueDate.toISOString() })
+        .eq('id', item.id)
+        .eq('user_id', userId);
     }
   } catch (error) {
     console.error('Error processing recurring transactions on read:', error);

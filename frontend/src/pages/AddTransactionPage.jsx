@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { createTransactionApi, updateTransactionApi } from '../services/api';
-import { CATEGORIES, PAYMENT_METHODS } from '../utils/helpers';
+import { CATEGORIES, PAYMENT_METHODS, getLocalDateString } from '../utils/helpers';
 import {
   X,
   Check,
@@ -19,6 +19,8 @@ import {
   ArrowUpRight,
   ArrowDownLeft,
   AlertTriangle,
+  Plus,
+  Tag,
 } from 'lucide-react';
 
 const CATEGORY_ICONS = {
@@ -39,6 +41,8 @@ const METHOD_ICONS = {
   bank_transfer: Building2,
 };
 
+const STORAGE_KEY_CUSTOM_CATS = 'walletwise_custom_categories';
+
 export const AddTransactionPage = ({ onClose, onSuccess, transactionToEdit = null }) => {
   const isEditMode = !!transactionToEdit;
 
@@ -47,7 +51,20 @@ export const AddTransactionPage = ({ onClose, onSuccess, transactionToEdit = nul
   const [category, setCategory] = useState('Food');
   const [paymentMethod, setPaymentMethod] = useState('upi');
   const [note, setNote] = useState('');
-  const [date, setDate] = useState(() => new Date().toISOString().split('T')[0]);
+  const [date, setDate] = useState(() => getLocalDateString(new Date()));
+
+  // Custom Categories state
+  const [customCategories, setCustomCategories] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_CUSTOM_CATS);
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [showAddCustomCat, setShowAddCustomCat] = useState(false);
+  const [newCatInput, setNewCatInput] = useState('');
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -61,10 +78,58 @@ export const AddTransactionPage = ({ onClose, onSuccess, transactionToEdit = nul
       setPaymentMethod(transactionToEdit.paymentMethod || 'upi');
       setNote(transactionToEdit.note || '');
       if (transactionToEdit.date) {
-        setDate(new Date(transactionToEdit.date).toISOString().split('T')[0]);
+        setDate(getLocalDateString(new Date(transactionToEdit.date)));
       }
     }
   }, [transactionToEdit]);
+
+  const handleAddCustomCategory = (e) => {
+    e.preventDefault();
+    const trimmed = newCatInput.trim();
+    if (!trimmed) return;
+
+    // Check duplicate against existing categories
+    const existsInDefaults = CATEGORIES.some((c) => c.id.toLowerCase() === trimmed.toLowerCase());
+    const existsInCustom = customCategories.some((c) => c.toLowerCase() === trimmed.toLowerCase());
+
+    if (existsInDefaults || existsInCustom) {
+      // Just select existing category
+      const matched = CATEGORIES.find((c) => c.id.toLowerCase() === trimmed.toLowerCase())?.id || trimmed;
+      setCategory(matched);
+    } else {
+      const updatedCustom = [...customCategories, trimmed];
+      setCustomCategories(updatedCustom);
+      try {
+        localStorage.setItem(STORAGE_KEY_CUSTOM_CATS, JSON.stringify(updatedCustom));
+      } catch (err) {
+        console.error('Failed to save custom category:', err);
+      }
+      setCategory(trimmed);
+    }
+
+    setNewCatInput('');
+    setShowAddCustomCat(false);
+  };
+
+  const constructIsoDate = (selectedDateStr) => {
+    if (!selectedDateStr) return new Date().toISOString();
+    const todayStr = getLocalDateString(new Date());
+    const now = new Date();
+
+    if (selectedDateStr === todayStr) {
+      // Keep exact current local time for today
+      return now.toISOString();
+    }
+
+    const [year, month, day] = selectedDateStr.split('-').map(Number);
+    if (isNaN(year) || isNaN(month) || isNaN(day)) {
+      return now.toISOString();
+    }
+
+    // Preserve local time on chosen date so UTC conversion doesn't shift day
+    const customDate = new Date(year, month - 1, day, now.getHours(), now.getMinutes(), now.getSeconds());
+    return customDate.toISOString();
+  };
 
   const executeSave = async () => {
     const parsedAmount = parseFloat(amount);
@@ -77,7 +142,7 @@ export const AddTransactionPage = ({ onClose, onSuccess, transactionToEdit = nul
         category,
         paymentMethod,
         note: note.trim() || undefined,
-        date: date ? new Date(date).toISOString() : undefined,
+        date: constructIsoDate(date),
       };
 
       if (isEditMode) {
@@ -104,7 +169,6 @@ export const AddTransactionPage = ({ onClose, onSuccess, transactionToEdit = nul
       return;
     }
 
-    // Check if editing a linked record -> show confirmation warning
     const isLinked = transactionToEdit && (transactionToEdit.affectsLinkedRecord || transactionToEdit.linkedLoanId || transactionToEdit.linkedGoalId);
     if (isEditMode && isLinked && !showLinkedWarning) {
       setShowLinkedWarning(true);
@@ -118,6 +182,18 @@ export const AddTransactionPage = ({ onClose, onSuccess, transactionToEdit = nul
     const current = parseFloat(amount) || 0;
     setAmount((current + addValue).toString());
   };
+
+  // Combine default categories + custom user categories
+  const allCategoryItems = [
+    ...CATEGORIES,
+    ...customCategories
+      .filter((catName) => !CATEGORIES.some((c) => c.id === catName))
+      .map((catName) => ({
+        id: catName,
+        label: catName,
+        isCustom: true,
+      })),
+  ];
 
   return (
     <div className="fixed inset-0 z-50 bg-primary-espresso/40 backdrop-blur-sm flex flex-col justify-end sm:justify-center p-0 sm:p-4">
@@ -238,14 +314,63 @@ export const AddTransactionPage = ({ onClose, onSuccess, transactionToEdit = nul
             </div>
           </div>
 
-          {/* Category Chips */}
+          {/* Category Chips with Custom Category Support */}
           <div>
-            <label className="block text-[11px] font-bold text-text-muted uppercase tracking-wider mb-2">
-              Category
-            </label>
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-[11px] font-bold text-text-muted uppercase tracking-wider">
+                Category
+              </label>
+              {!showAddCustomCat && (
+                <button
+                  type="button"
+                  onClick={() => setShowAddCustomCat(true)}
+                  className="text-[11px] font-bold text-secondary-coffee hover:text-primary-espresso flex items-center space-x-1 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
+                  <span>New Category</span>
+                </button>
+              )}
+            </div>
+
+            {/* Inline Custom Category Creator Input */}
+            {showAddCustomCat && (
+              <div className="mb-3 p-2.5 rounded-xl bg-tertiary-latte/20 border border-secondary-coffee/30 flex items-center space-x-2 animate-in fade-in duration-150">
+                <Tag className="w-4 h-4 text-secondary-coffee shrink-0" />
+                <input
+                  type="text"
+                  autoFocus
+                  placeholder="Enter custom category..."
+                  value={newCatInput}
+                  onChange={(e) => setNewCatInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleAddCustomCategory(e);
+                  }}
+                  className="flex-1 bg-surface-card px-3 py-1.5 border border-cream-border rounded-lg text-xs text-text-main focus:outline-none focus:ring-1 focus:ring-secondary-coffee"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddCustomCategory}
+                  className="px-3 py-1.5 bg-primary-espresso text-warm-bg rounded-lg text-xs font-bold hover:bg-secondary-coffee transition-colors shadow-warm-sm"
+                >
+                  Add
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAddCustomCat(false);
+                    setNewCatInput('');
+                  }}
+                  className="p-1.5 text-text-muted hover:text-text-main"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
+            {/* Category Chips List */}
             <div className="flex flex-wrap gap-2">
-              {CATEGORIES.map((cat) => {
-                const Icon = CATEGORY_ICONS[cat.id] || MoreHorizontal;
+              {allCategoryItems.map((cat) => {
+                const Icon = CATEGORY_ICONS[cat.id] || Tag;
                 const isSelected = category === cat.id;
                 return (
                   <button
