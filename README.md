@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" width="100%" alt="WalletWise">
+  <img src="screenshots/banner.png" width="100%" alt="WalletWise">
 </p>
 
 <p align="center">
